@@ -145,6 +145,70 @@ class NVFP4Quantizer:
             
         return x_quant, macro_scales, micro_scales_quant_blocked
 
+def get_hadamard_matrix(n: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    """
+    Constructs a normalized Walsh-Hadamard matrix of size n x n (n must be a power of 2).
+    """
+    import math
+    H = torch.tensor([[1.0, 1.0], [1.0, -1.0]], device=device, dtype=dtype)
+    current_size = 2
+    while current_size < n:
+        H = torch.cat([
+            torch.cat([H, H], dim=1),
+            torch.cat([H, -H], dim=1)
+        ], dim=0)
+        current_size *= 2
+    if n == 1:
+        return torch.ones((1, 1), device=device, dtype=dtype)
+    return H / math.sqrt(n)
+
+def apply_rht(grad_output_flat: torch.Tensor, input_flat: torch.Tensor, quantizer: NVFP4Quantizer = None, stochastic: bool = True) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Applies the Random Hadamard Transform along the contracting dimension (rows)
+    of both grad_output_flat [M, C_out] and input_flat [M, C_in].
+    Then optionally quantizes the resulting transformed matrices using NVFP4Quantizer.
+    
+    This disperses outliers across the sequence/token/batch dimension so that they do
+    not get clipped during FP4 quantization, while preserving the exact inner product.
+    """
+    import math
+    M = grad_output_flat.shape[0]
+    # Find next power of 2 for Hadamard matrix
+    N = 2 ** int(math.ceil(math.log2(M)))
+    
+    # Pad both matrices to size N along dimension 0
+    if N > M:
+        pad_grad = torch.zeros(N - M, grad_output_flat.shape[1], device=grad_output_flat.device, dtype=grad_output_flat.dtype)
+        pad_input = torch.zeros(N - M, input_flat.shape[1], device=input_flat.device, dtype=input_flat.dtype)
+        grad_padded = torch.cat([grad_output_flat, pad_grad], dim=0)
+        input_padded = torch.cat([input_flat, pad_input], dim=0)
+    else:
+        grad_padded = grad_output_flat
+        input_padded = input_flat
+        
+    # Generate random sign vector of size N
+    # Fixed/cached relative to current execution context, but stochastic over steps
+    sign_vector = torch.randint(0, 2, (N, 1), device=grad_output_flat.device, dtype=grad_output_flat.dtype) * 2.0 - 1.0
+    
+    # Apply sign vector (element-wise multiplication along columns)
+    grad_signed = grad_padded * sign_vector
+    input_signed = input_padded * sign_vector
+    
+    # Get Hadamard matrix
+    H = get_hadamard_matrix(N, grad_output_flat.device, grad_output_flat.dtype)
+    
+    # Transform (H @ signed_matrix)
+    grad_trans = H @ grad_signed
+    input_trans = H @ input_signed
+    
+    # Quantize to FP4 if quantizer is provided
+    if quantizer is not None:
+        grad_trans_q, _, _ = quantizer.quantize_and_scale(grad_trans, stochastic=stochastic)
+        input_trans_q, _, _ = quantizer.quantize_and_scale(input_trans, stochastic=stochastic)
+        return grad_trans_q, input_trans_q
+        
+    return grad_trans, input_trans
+
 class NVFP4LinearFunction(torch.autograd.Function):
     """
     Straight-Through Estimator (STE) for NVFP4 Linear Layer Forward/Backward passes.
@@ -153,6 +217,8 @@ class NVFP4LinearFunction(torch.autograd.Function):
     def forward(ctx, input: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor = None, 
                 quantizer: NVFP4Quantizer = None, stochastic: bool = True) -> torch.Tensor:
         ctx.save_for_backward(input, weight, bias)
+        ctx.quantizer = quantizer
+        ctx.stochastic = stochastic
         
         # Quantize weights and activations to FP4 during forward pass
         if quantizer is not None:
@@ -168,6 +234,8 @@ class NVFP4LinearFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, None, None]:
         input, weight, bias = ctx.saved_tensors
+        quantizer = ctx.quantizer
+        stochastic = ctx.stochastic
         
         # Gradients with respect to input, weight, bias
         # Backprop through linear is standard, using Straight-Through Estimator (STE)
@@ -176,7 +244,10 @@ class NVFP4LinearFunction(torch.autograd.Function):
         # Reshape grad_output and input to compute weight gradient
         grad_output_flat = grad_output.reshape(-1, grad_output.shape[-1])
         input_flat = input.reshape(-1, input.shape[-1])
-        grad_weight = grad_output_flat.t().matmul(input_flat)
+        
+        # Apply Random Hadamard Transform (RHT) for outlier dispersion in FP4 weight-grad GEMM
+        grad_output_trans, input_trans = apply_rht(grad_output_flat, input_flat, quantizer, stochastic)
+        grad_weight = grad_output_trans.t().matmul(input_trans)
         
         grad_bias = None
         if bias is not None:
