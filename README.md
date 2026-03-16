@@ -54,26 +54,26 @@ The flowchart below demonstrates the integration of NVFP4 dual-level scaling, Ra
 ```mermaid
 graph TD
     subgraph FORWARD PASS
-        A[FP32/BF16 Inputs & Weights] --> B[Dual-Level MX Scaling: FP8 micro-scale + FP32 tensor-scale]
-        B --> C[Stochastic Rounding to NVFP4 E2M1]
-        C --> D[Linear Forward Pass: native FP4 GEMM simulation]
-        D --> E[Triton Fused Attention: TMEM tiling + FMA Taylor Softmax]
-        E --> F[Compute Cross-Entropy Loss]
+        A["FP32/BF16 Inputs & Weights"] --> B["Dual-Level MX Scaling: FP8 micro-scale + FP32 tensor-scale"]
+        B --> C["Stochastic Rounding to NVFP4 E2M1"]
+        C --> D["Linear Forward Pass: native FP4 GEMM simulation"]
+        D --> E["Triton Fused Attention: TMEM tiling + FMA Taylor Softmax"]
+        E --> F["Compute Cross-Entropy Loss"]
     end
 
     subgraph BACKWARD PASS
-        F --> G[Grad Outputs]
-        G --> H[RHT Outlier Dispersion: Pad to power of 2 & multiply by U = 1/sqrt(N) * H * D]
-        H --> I[Quantize transformed inputs & grads to NVFP4]
-        I --> J[Compute Weight Gradient GEMM in 4-bit precision]
-        J --> K[Transpose back to original space: preserves inner-product mathematically]
+        F --> G["Grad Outputs"]
+        G --> H["RHT Outlier Dispersion: Pad to power of 2 & multiply by U = 1/sqrt(N) * H * D"]
+        H --> I["Quantize transformed inputs & grads to NVFP4"]
+        I --> J["Compute Weight Gradient GEMM in 4-bit precision"]
+        J --> K["Transpose back to original space: preserves inner-product mathematically"]
     end
 
     subgraph OPTIMIZATION
-        K --> L[DeepSpeed ZeRO++ Communication: hpZ + qwZ + qgZ]
-        L --> M[Muon Optimizer: Newton-Schulz Orthogonalization]
-        M --> N[MuonClip/QK-Clip: Rescale QK weight updates to prevent attention collapse]
-        N --> O[Apply stabilized parameter update to FP32 master weights]
+        K --> L["DeepSpeed ZeRO++ Communication: hpZ + qwZ + qgZ"]
+        L --> M["Muon Optimizer: Newton-Schulz Orthogonalization"]
+        M --> N["MuonClip/QK-Clip: Rescale QK weight updates to prevent attention collapse"]
+        N --> O["Apply stabilized parameter update to FP32 master weights"]
         O --> A
     end
 ```
